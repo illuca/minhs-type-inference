@@ -63,17 +63,166 @@ infer program = runTC $ inferProgram BEmpty program
 
 -- | Perform unification of the given types
 unify :: Gamma -> Type -> Type -> TC Gamma
-unify g t1 t2 = error "implement me!"
+
+-- SKIP-MARK
+unify (g1 :< mark) (FlexVar t1) (FlexVar t2) = unify g1 (FlexVar t1) (FlexVar t2)
+-- SKIP-TM
+unify (g1 :< TermVar id scheme) (FlexVar t1) (FlexVar t2) = do
+  g2 <- unify g1 (FlexVar t1) (FlexVar t2)
+  return (g2 :< TermVar id scheme)
+
+unify (g1 :< (:=) p decl) (FlexVar a) (FlexVar b)
+  -- REFL
+  | a == b = return g1'
+  -- SKIP-TY
+  | p /= a && p /= b = do
+      g2 <- unify g1 (FlexVar a) (FlexVar b)
+      return g1'
+  -- DEFN
+  | p == a && p /= b = do
+      return (g1 :< (:=) p (Defn $ FlexVar b))
+  | otherwise = case decl of
+        Defn t -> do
+            let subs = S.fromList [(p,t)]
+                aS = S.substFlex subs (getType g1' a)
+                bS = S.substFlex subs (getType g1' b)
+            g2 <- unify g1 aS bS
+            return (g2 :< (:=) p decl) 
+        _ -> error $ "\ng1: " ++ show g1' 
+                  ++ "\n" ++ show (FlexVar a)
+                  ++ "\n" ++ show (FlexVar b)
+  where g1' = g1 :< (:=) p decl
+
+-- INST
+unify g1 (FlexVar t1) t2 = inst g1 [] t1 t2
+
+unify g1 t1 (FlexVar t2) = inst g1 [] t2 t1
+
+-- my-PROD
+
+-- ARROW
+unify g1 (Arrow a b) (Arrow a' b') =
+  do  g2 <- unify g1 a a'
+      g3 <- unify g2 b b'
+      return g3
+
+--unify g1 a (Arrow a' _) = unify g1 a a'
+--unify g1 (Arrow a b) a' = unify g1 a a'
+
+unify g t1 t2
+  | t1 == t2 = return g
+  | otherwise =
+      error $ show g
+        ++ "\nt1:" ++ show t1
+        ++ "\nt2:" ++ show t2
 
 -- | Instantiation the type variable a with the type t
 inst :: Gamma -> Suffix -> Id -> Type -> TC Gamma
-inst g zs a t = error "implement me!"
+
+inst (g1 :< (:=) b bDecl) suffix a t
+  -- DEFN
+  | b == a && notMember a (ffv t) =
+      return (extend g1 suffix :< (:=) a (Defn t))
+  -- DEPEND
+  | b /= a && member b (ffv t) =
+      inst g1 ((b, bDecl):suffix) a t
+  -- SKIP-TY
+  | b /= a && notMember b (ffv t) = do
+      g2 <- inst g1 suffix a t
+      return (g2 :< (:=) b bDecl)
+  -- SUBST
+  | otherwise = case bDecl of
+        Defn t' ->  do
+              let subs = S.fromList [(b,t')]
+                  aS = S.substFlex subs (getType g1' a)
+                  tS = S.substFlex subs t
+              g2 <- unify (extend g1 suffix) aS tS
+              return (g2 :< (:=) b bDecl)
+        _ ->  error $ "\nΓ: " ++ show g1'
+                    ++ "\nb: " ++ show b
+                    ++ "\nsuffix: " ++ show suffix
+                    ++ "\na: " ++ show a
+                    ++ "\nt: " ++ show t
+    where g1' = g1 :< (:=) b bDecl
 
 inferProgram :: Gamma -> Program -> TC (Program, Gamma)
-inferProgram g (SBind x _ e) = error "implement me!"
+inferProgram g1 (SBind x _ e) = do
+  (t,g') <- inferExp g1 e
+  return (SBind x (Just $ Forall [] t) e, g')
+
+inferProgram g1 program = error $
+     "\ng1: " ++ show g1 ++
+     "\nprogram: " ++ show program
+
 
 inferExp :: Gamma -> Exp -> TC (Type, Gamma)
-inferExp g e = error "implement me!"
+
+-- VAR
+-- INT
+inferExp g (Num _) = return (Base Int, g)
+-- CON
+-- ConType for True,False,(),Pair,Inl,Inr
+inferExp g (Con c) =
+  case conType c of
+    Just scheme -> do
+      (t, suffix) <- specialise scheme
+      return (t, extend g suffix)
+-- PRIM
+-- prim operations for Ge,Ge,Lt,Le,Eq,Ne,Neg,Fst,Snd
+inferExp g (Prim op) = do
+  (t, suffix) <- specialise (primOpType op)
+  return (t, extend g suffix)
+
+-- APP
+inferExp g1 (App e1 e2) =
+  do
+    (ty1, g2) <- inferExp g1 e1
+    (ty2, g3) <- inferExp g2 e2
+    (p, g3') <-  introduce g3
+    g4 <- unify g3' ty1 (Arrow ty2 $ FlexVar p)
+    t <- lastFlex g4
+    let subs = S.fromList $ tolist g4
+        t' = S.substFlex subs t
+    return (t', g4)
+
+
+inferExp g e = error $ show e
+
 -- -- Note: this is the only case you need to handle for case expressions
 -- inferExp g (Case e [Alt "Inl" [x] e1, Alt "Inr" [y] e2])
 -- inferExp g (Case e _) = typeError MalformedAlternatives
+
+introduce :: Gamma -> TC (Id, Gamma)
+introduce g =
+  do id <- freshId
+     return (id, g :< (:=) id HOLE)
+
+
+lastFlex :: Gamma -> TC Type
+lastFlex g =
+  case g of
+    xs :< (:=) id (Defn t) -> return t
+--    xs :< (:=) id t -> return t
+    _ -> error $ show g
+
+-- | Perform unification of the given types
+notFlexVar :: Type -> Bool
+notFlexVar = not . isFlexVar
+
+isFlexVar :: Type -> Bool
+isFlexVar (FlexVar _) = True
+isFlexVar _ = False
+
+tolist :: Gamma -> [(Id,Type)]
+tolist BEmpty = []
+tolist (xs :< x) =
+  case x of
+    (:=) id (Defn t) -> (id,t) : tolist xs
+    _ -> tolist xs
+    
+getType :: Gamma -> Id -> Type
+getType BEmpty id = error $ "cannot find " ++ show id
+getType (xs :< x) id =
+  case x of
+    (:=) id' (Defn t) -> if id == id' then t else getType xs id
+    _ -> getType xs id
