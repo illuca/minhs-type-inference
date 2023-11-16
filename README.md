@@ -1,0 +1,1 @@
+# minhs-type-inference
