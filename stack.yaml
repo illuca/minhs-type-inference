@@ -66,4 +66,4 @@ packages:
 # Allow a newer minor version of GHC than the snapshot specifies
 # compiler-check: newer-minor
 ghc-options:
-  "$locals": -Wno-overlapping-patterns -Wno-name-shadowing -Wno-unused-matches -Wno-incomplete-patterns -Wno-unused-imports -Wno-unused-local-binds -Wno-unused-do-bind
+  "$locals": -Wno-overlapping-patterns -Wno-name-shadowing -Wno-unused-matches -Wno-incomplete-patterns -Wno-unused-imports -Wno-unused-local-binds -Wno-unused-do-bind -Wno-incomplete-uni-patterns -Wno-missing-signatures

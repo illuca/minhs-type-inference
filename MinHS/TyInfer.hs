@@ -58,14 +58,14 @@ extend :: Gamma -> Suffix -> Gamma
 extend g [] = g
 extend g ((v,d) : ds) = extend (g :< v := d) ds
 
-infer :: Program -> Either TypeError (Program, Gamma)
+--infer :: Program -> Either TypeError (Program, Gamma)
 infer program = runTC $ inferProgram BEmpty program
 
 -- | Perform unification of the given types
 unify :: Gamma -> Type -> Type -> TC Gamma
 
 -- SKIP-MARK
-unify (g1 :< mark) (FlexVar t1) (FlexVar t2) = unify g1 (FlexVar t1) (FlexVar t2)
+unify (g1 :< Mark) (FlexVar t1) (FlexVar t2) = unify g1 (FlexVar t1) (FlexVar t2)
 -- SKIP-TM
 unify (g1 :< TermVar id scheme) (FlexVar t1) (FlexVar t2) = do
   g2 <- unify g1 (FlexVar t1) (FlexVar t2)
@@ -87,8 +87,8 @@ unify (g1 :< (:=) p decl) (FlexVar a) (FlexVar b)
                 aS = S.substFlex subs (getType g1' a)
                 bS = S.substFlex subs (getType g1' b)
             g2 <- unify g1 aS bS
-            return (g2 :< (:=) p decl) 
-        _ -> error $ "\ng1: " ++ show g1' 
+            return (g2 :< (:=) p decl)
+        _ -> error $ "\ng1: " ++ show g1'
                   ++ "\n" ++ show (FlexVar a)
                   ++ "\n" ++ show (FlexVar b)
   where g1' = g1 :< (:=) p decl
@@ -147,8 +147,8 @@ inst (g1 :< (:=) b bDecl) suffix a t
 
 inferProgram :: Gamma -> Program -> TC (Program, Gamma)
 inferProgram g1 (SBind x _ e) = do
-  (t,g') <- inferExp g1 e
-  return (SBind x (Just $ Forall [] t) e, g')
+  (scheme, g2) <- generalize g1 e
+  return (SBind x (Just scheme) e, g2)
 
 inferProgram g1 program = error $
      "\ng1: " ++ show g1 ++
@@ -158,8 +158,18 @@ inferProgram g1 program = error $
 inferExp :: Gamma -> Exp -> TC (Type, Gamma)
 
 -- VAR
+inferExp g (Var x) = do
+  let (Forall ps tau) = getScheme g x
+  pqs <- freshForall ps
+  let subs = S.fromList $ map (\pq -> (fst pq, FlexVar $ snd pq)) pqs
+      tau' = S.substRigid subs tau
+      qSuffix = map (\pq -> (snd pq, HOLE)) pqs
+  return (tau',extend g qSuffix)
+
+
 -- INT
 inferExp g (Num _) = return (Base Int, g)
+
 -- CON
 -- ConType for True,False,(),Pair,Inl,Inr
 inferExp g (Con c) =
@@ -181,16 +191,57 @@ inferExp g1 (App e1 e2) =
     (p, g3') <-  introduce g3
     g4 <- unify g3' ty1 (Arrow ty2 $ FlexVar p)
     t <- lastFlex g4
-    let subs = S.fromList $ tolist g4
-        t' = S.substFlex subs t
-    return (t', g4)
+--    let subs = S.fromList $ tolist g4
+--        t' = S.substFlex subs t
+    return (t, g4)
 
+-- Let
+inferExp g1 (Let [SBind x _ e1] e2) = do
+   (sigma, g2) <- generalize g1 e1
+   (tau,gtmp) <- inferExp (g2:< TermVar x sigma) e2
+   let  suffix = tosuffix $ takeWhilst notX gtmp
+--   error $ show $ dropWhilst notX gtmp
+        (g3 :< TermVar _ _) = dropWhilst notX gtmp 
+   return (tau, extend g3 suffix)
+   where
+     notX = not . isX
+     isX (TermVar x' scheme) = x == x'
+     isX _ = False
+
+--inferExp g1 (Let e1 e2) = do
 
 inferExp g e = error $ show e
 
 -- -- Note: this is the only case you need to handle for case expressions
 -- inferExp g (Case e [Alt "Inl" [x] e1, Alt "Inr" [y] e2])
 -- inferExp g (Case e _) = typeError MalformedAlternatives
+
+-- GEN
+generalize :: Gamma -> Exp -> TC (Scheme, Gamma)
+generalize g1 e = do
+  (tau, g2) <- inferExp (g1 :< Mark) e
+  let bwd = takeWhilst notMark g2
+      suffix = reverse $ tosuffix bwd
+  scheme <- gen suffix tau []
+  return (scheme, g2)
+  where
+    notMark = not . isMark
+    isMark Mark = True
+    isMark _ = False
+
+-- gen
+gen :: Suffix -> Type -> Suffix -> TC Scheme
+gen [] tau s2 = return (mono tau)
+
+gen ((id,Defn idT):s1) tau s2 = do
+  let subst = S.fromList [(id,idT)]
+      tau' = S.substFlex subst tau
+  gen s1 tau' s2
+
+gen ((id, HOLE):s1) tau s2 = do
+  let subst = S.fromList [(id, RigidVar id)]
+      tau' = S.substFlex subst tau
+  gen s1 tau' ((id, HOLE):s2)
 
 introduce :: Gamma -> TC (Id, Gamma)
 introduce g =
@@ -202,7 +253,6 @@ lastFlex :: Gamma -> TC Type
 lastFlex g =
   case g of
     xs :< (:=) id (Defn t) -> return t
---    xs :< (:=) id t -> return t
     _ -> error $ show g
 
 -- | Perform unification of the given types
@@ -213,16 +263,30 @@ isFlexVar :: Type -> Bool
 isFlexVar (FlexVar _) = True
 isFlexVar _ = False
 
+tosuffix :: Gamma -> Suffix
+tosuffix BEmpty = []
+tosuffix (xs :< x) =
+  case x of
+    (:=) id decl -> (id,decl) : tosuffix xs
+    _ -> tosuffix xs
+
 tolist :: Gamma -> [(Id,Type)]
 tolist BEmpty = []
 tolist (xs :< x) =
   case x of
     (:=) id (Defn t) -> (id,t) : tolist xs
     _ -> tolist xs
-    
+
 getType :: Gamma -> Id -> Type
-getType BEmpty id = error $ "cannot find " ++ show id
+getType BEmpty id = error $ "cannot find type for " ++ show id
 getType (xs :< x) id =
   case x of
     (:=) id' (Defn t) -> if id == id' then t else getType xs id
     _ -> getType xs id
+
+getScheme :: Gamma -> Id -> Scheme
+getScheme BEmpty id = error $ "cannot find scheme for " ++ show id
+getScheme (xs :< x) id =
+  case x of
+    TermVar id' scheme -> if id == id' then scheme else getScheme xs id
+    _ -> getScheme xs id
