@@ -1,9 +1,11 @@
 module MinHS.TyInfer where
 
 import MinHS.Bwd
+import Prelude hiding (span)
 import MinHS.Syntax
 import qualified MinHS.Subst as S (Subst, SubstSem, substFlex, substRigid, fromList)
 import MinHS.TCMonad
+import Data.Foldable as F (toList)
 
 import Control.Monad (foldM)
 import Data.List (delete)
@@ -120,14 +122,16 @@ unify g1 (Prod a b) (Prod a' b') = do
   g3 <- unify g2 b b'
   return g3
 
+unify g1 (Sum a b) (Sum a' b') = do
+  g2 <- unify g1 a a'
+  g3 <- unify g2 b b'
+  return g3
+
 -- ARROW
 unify g1 (Arrow a b) (Arrow a' b') = do
   g2 <- unify g1 a a'
   g3 <- unify g2 b b'
   return g3
-
---unify g1 a (Arrow a' _) = unify g1 a a'
---unify g1 (Arrow a b) a' = unify g1 a a'
 
 unify g t1 t2
   | t1 == t2 = return g
@@ -146,7 +150,7 @@ inst (g1 :< Mark) suffix a tau = do
   g2 <- inst g1 suffix a tau
   return (g2 :< Mark)
 
-inst (g1 :< (:=) b (Defn tau')) suffix a tau = do 
+inst (g1 :< (:=) b (Defn tau')) suffix a tau = do
   let subs = S.fromList [(b,tau')]
       aS = S.substFlex subs (getType g1' a)
       tS = S.substFlex subs tau
@@ -155,7 +159,7 @@ inst (g1 :< (:=) b (Defn tau')) suffix a tau = do
   where g1' = g1 :< (:=) b (Defn tau')
 
 inst (g1 :< (:=) b HOLE) suffix a tau
-  -- DEFN 
+  -- DEFN
   | b == a && notMember a (ffv tau) = do
      return (extend g1 suffix :< (:=) a (Defn tau))
   -- DEPEND
@@ -164,7 +168,7 @@ inst (g1 :< (:=) b HOLE) suffix a tau
   -- SKIP-TY
   | b /= a && notMember b (ffv tau) = do
       g2 <- inst g1 suffix a tau
-      return (g2 :< (:=) b HOLE) 
+      return (g2 :< (:=) b HOLE)
 
 
 inst g1 suffix a t = error $ "\nΓ: " ++ show g1
@@ -181,6 +185,29 @@ inferProgram g1 program = error $
      "\ng1: " ++ show g1 ++
      "\nprogram: " ++ show program
 
+-- GEN
+generalize :: Gamma -> Exp -> TC (Scheme, Gamma)
+generalize g1 e = do
+  (tau, g2) <- inferExp (g1 :< Mark) e
+  let suffix = reverse $ takeSuffix notMark g2
+  scheme <- gen suffix tau []
+  return (scheme, g2)
+
+-- gen
+gen :: Suffix -> Type -> Suffix -> TC Scheme
+gen [] tau s2 = do
+  let ids = [fst item | item <- s2, fst item `elem` frv tau]
+  return (Forall ids tau)
+
+gen ((a,Defn tau'):s1) tau s2 = do
+  let subst = S.fromList [(a,tau')]
+      resT = S.substFlex subst tau
+  gen s1 resT s2
+
+gen ((id, HOLE):s1) tau s2 = do
+  let subst = S.fromList [(id, RigidVar id)]
+      resT = S.substFlex subst tau
+  gen s1 resT ((id, HOLE):s2)
 
 inferExp :: Gamma -> Exp -> TC (Type, Gamma)
 
@@ -236,53 +263,50 @@ inferExp g1 (If e et ef) = do
   return (tauT, g6)
 
 -- CASE
---inferExp g1 (Case e [(Alt _ [x] e1), Alt _ [y] e2]) = do
---  (tau, g2) <- e
---  a <- freshId
---  b <- freshId
---  g3 <- unify (g2 :< (:=) a HOLE :< (:=) b HOLE) 
---              tau 
---              (Sum (Flex a) (Flex b))
---  (tau1, g4tmp) <- inferExp (g3 :< TermVar x (Flex a)) e1
---  
---  return (tau1, g6)  
+inferExp g1 (Case e [Alt _ [x] e1, Alt _ [y] e2]) = do
+  (tau, g2) <- inferExp g1 e
+  a <- freshId
+  b <- freshId
+  let aF = FlexVar a
+      bF = FlexVar b
+  g3 <- unify (g2 :< (:=) a HOLE :< (:=) b HOLE)
+              tau
+              (Sum  aF bF)
+  (tau1, g4tmp) <- inferExp (g3 :< (:=) x (Defn aF))
+                            e1
+  let (g4 :< (:=) _ _, gSuffix) = span (notId x) g4tmp
+      suffix = toSuffix gSuffix
+  (tau2, g5tmp) <- inferExp (extend g4 suffix :< (:=) y (Defn bF))
+                            e2
+  let (g5 :< (:=) _ _, gSuffix') = span (notId y) g5tmp
+      suffix' = toSuffix gSuffix'
+  g6 <- unify (extend g5 suffix') tau1 tau2
+  return (tau1, g6)
 
 -- RECFUN
 inferExp g1 (Recfun (MBind f x e)) = do
   a <- freshId
   b <- freshId
+  let aF = FlexVar a
+      bF = FlexVar b
   (tau,gtmp) <- inferExp
                   (g1 :< (:=) a HOLE
                       :< (:=) b HOLE
-                      :< (:=) x (Defn (FlexVar a))
-                      :< (:=) f (Defn (FlexVar b)))
+                      :< (:=) x (Defn aF)
+                      :< (:=) f (Defn bF))
                   e
-  let g2 :< (:=) x (Defn aF) = dropWhilst notX gtmp
-      bF = getType gtmp f
-      suffix = takeSuffix notF gtmp
+  let (g2 :< (:=) _ _ :< (:=) _ _, gsuffix) = span (notId f) gtmp
+      suffix = toSuffix gsuffix
   g3 <- unify (extend g2 suffix) bF (Arrow aF tau)
   return (bF, g3)
-  where
-    notF = not . isF
-    isF ((:=) f' _) = f == f'
-    isF _ = False
-
-    notX = not . isX
-    isX ((:=) x' _) = x == x'
-    isX _ = False
 
 -- Let
 inferExp g1 (Let [SBind x _ e1] e2) = do
    (sigma, g2) <- generalize g1 e1
    (tau,gtmp) <- inferExp (g2:< TermVar x sigma) e2
-   let  suffix = takeSuffix notX gtmp
-        (g3 :< TermVar _ _) = dropWhilst notX gtmp
-   return (tau, extend g3 suffix)
-   where
-     notX = not . isX
-     isX (TermVar x' scheme) = x == x'
-     isX _ = False
-
+   let (left :< Mark, right) = span notMark gtmp
+       (g3 :< TermVar _ _, suffix) = span (notId x) (left <>< F.toList right)
+   return (tau, g3 <>< F.toList suffix)
 
 inferExp g e = error $ show e
 
@@ -293,31 +317,6 @@ inferExp g e = error $ show e
 xx :: Gamma -> Id -> Gamma
 g `xx` id = g :< (:=) id HOLE
 
--- GEN
-generalize :: Gamma -> Exp -> TC (Scheme, Gamma)
-generalize g1 e = do
-  (tau, g2) <- inferExp (g1 :< Mark) e
-  let suffix = reverse $ takeSuffix notMark g2
-  scheme <- gen suffix tau []
-  return (scheme, g2)
-  where
-    notMark = not . isMark
-    isMark Mark = True
-    isMark _ = False
-
--- gen
-gen :: Suffix -> Type -> Suffix -> TC Scheme
-gen [] tau s2 = return (mono tau)
-
-gen ((a,Defn tau'):s1) tau s2 = do
-  let subst = S.fromList [(a,tau')]
-      resT = S.substFlex subst tau
-  gen s1 resT s2
-
-gen ((id, HOLE):s1) tau s2 = do
-  let subst = S.fromList [(id, RigidVar id)]
-      resT = S.substFlex subst tau
-  gen s1 resT ((id, HOLE):s2)
 
 introduce :: Gamma -> TC (Id, Gamma)
 introduce g =
@@ -378,7 +377,6 @@ getScheme BEmpty id = error $ "cannot find scheme for " ++ show id
 getScheme (xs :< x) id =
   case x of
     TermVar id' scheme -> if id == id' then scheme else getScheme xs id
---    (:=) id' (Defn t) -> if id == id' then mono t else getScheme xs id
     _ -> getScheme xs id
 
 ppType :: Type -> String
@@ -389,10 +387,10 @@ ppType (Base Unit) = "()"
 ppType (Base t) = show t
 ppType (FlexVar id) = id
 ppType (RigidVar id) = id ++ "R"
-ppT = removeQuotes . ppType
+ppt = removeQuotes . ppType
 
 ppBwdEntry :: Entry -> String
-ppBwdEntry (TermVar id scheme) = "TermVar " ++ id ++ " " ++ show scheme
+ppBwdEntry (TermVar id scheme) = id ++ ": " ++ ppScheme scheme
 ppBwdEntry ((:=) id HOLE) = id
 ppBwdEntry ((:=) id (Defn t)) = id ++ ": " ++ ppType t
 ppBwdEntry Mark = "Mark"
@@ -401,22 +399,36 @@ ppBwd :: Show a => Bwd a -> String
 ppBwd BEmpty = "$"
 ppBwd (xs :< x) = ppBwd xs ++ show x ++ ", "
 
-ppSchemeEntry :: (Id,Decl) -> String
-ppSchemeEntry (id, HOLE) = id
-ppSchemeEntry (id, Defn t) = id ++ ": " ++ ppType t
+ppScheme :: Scheme -> String
+ppScheme (Forall ids tau) = "forall " ++ show ids ++ " " ++ ppt tau
 
-ppScheme :: Show a => [a]-> String
-ppScheme [] = ""
-ppScheme (x:xs) = show x ++ ", " ++ ppScheme xs
+ppSuffixEntry :: (Id,Decl) -> String
+ppSuffixEntry (id, HOLE) = id
+ppSuffixEntry (id, Defn t) = id ++ ": " ++ ppType t
 
-ppS :: Suffix -> String
-ppS suffix = "Δ: " ++ (removeQuotes . ppScheme . fmap ppSchemeEntry) suffix
+ppSuffix :: Show a => [a]-> String
+ppSuffix [] = ""
+ppSuffix (x:xs) = show x ++ ", " ++ ppSuffix xs
 
-ppG :: Gamma -> String
-ppG g = "Γ: " ++ (removeQuotes . ppBwd . fmap ppBwdEntry) g
+pps :: Suffix -> String
+pps suffix = "Δ: " ++ (removeQuotes . ppSuffix . fmap ppSuffixEntry) suffix
+
+ppg :: Gamma -> String
+ppg g = "Γ: " ++ (removeQuotes . ppBwd . fmap ppBwdEntry) g
 
 removeQuotes :: String -> String
-removeQuotes = filter (`notElem` ['"', '\'', '1'])
-
+removeQuotes = filter (`notElem` ['"', '\'', '1','\\'])
 
 dot x = trace x (return ())
+
+notId :: Id -> Entry -> Bool
+notId id entry = not $ isId id entry
+
+isId :: Id -> Entry -> Bool
+isId id ((:=) id' _) = id == id'
+isId id (TermVar id' _) = id == id'
+isId id _ = False
+
+notMark = not . isMark
+isMark Mark = True
+isMark _ = False
